@@ -1,6 +1,9 @@
 /**
  * Centralized configuration for Ada iMessage agent.
  * All env vars and defaults in one place.
+ *
+ * InsForge config mirrors the iOS app's constants/config.ts so the
+ * iMessage channel plugs into the exact same backend.
  */
 
 export const config = {
@@ -17,20 +20,26 @@ export const config = {
     .map((id) => id.trim())
     .filter(Boolean),
 
-  // InsForge backend
+  // InsForge backend (same as EXPO_PUBLIC_INSFORGE_URL / EXPO_PUBLIC_INSFORGE_ANON_KEY in iOS app)
   insforge: {
-    baseUrl: process.env.INSFORGE_BASE_URL ?? "",
-    apiKey: process.env.INSFORGE_API_KEY ?? "",
+    url: process.env.INSFORGE_URL ?? "",
+    anonKey: process.env.INSFORGE_ANON_KEY ?? "",
     get enabled() {
-      return !!this.baseUrl && !!this.apiKey;
+      return !!this.url && !!this.anonKey;
     },
-    timeout: 30_000,
+  },
+
+  // InsForge user credentials for the iMessage agent to authenticate
+  // This is the Ada user account whose items/memory the agent reads/writes.
+  insforgeUser: {
+    email: process.env.INSFORGE_USER_EMAIL ?? "",
+    password: process.env.INSFORGE_USER_PASSWORD ?? "",
   },
 
   // Sync server
   syncServerPort: parseInt(process.env.SYNC_SERVER_PORT ?? "3001", 10),
 
-  // API keys
+  // API keys (used for local fallback when InsForge is unreachable)
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
   openaiApiKey: process.env.OPENAI_API_KEY ?? "",
   supermemoryApiKey: process.env.SUPERMEMORY_API_KEY ?? "",

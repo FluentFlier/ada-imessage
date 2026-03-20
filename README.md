@@ -1,117 +1,110 @@
 # Ada for iMessage
 
-> An additional input channel for [Ada](https://tryada.app), bringing your AI secretary into iMessage conversations.
+> Text Ada anything. She saves it, remembers it, and follows through.
 
-## What is Ada?
+Ada is an AI secretary that lives in the iOS share sheet ([tryada.app](https://tryada.app)). When you're reading an article, browsing a restaurant, or looking at a flight, you hit Share and Ada handles it: saves it to memory, sets a reminder, adds it to your calendar, or drafts a follow-up.
 
-Ada is an AI secretary that lives in the iOS share sheet. When you're reading an article, browsing a restaurant, or looking at a flight, you hit Share and Ada handles it: saves it to memory, sets a reminder, adds it to your calendar, or drafts a follow-up. Ada doesn't wait to be asked. She acts.
+This repo extends Ada into iMessage. Same secretary, same memory, same backend. Different input surface.
 
-Ada's primary surface is iOS. This repo extends Ada's reach into iMessage.
+**One sentence:** Ada on iOS captures intent from apps. Ada on iMessage captures intent from conversations.
 
-## What is this?
+---
 
-This is **Ada's iMessage channel**, not a standalone chatbot. Think of it this way:
+## How It Works
 
-- **Ada on iOS** captures intent from apps via the share sheet
-- **Ada on iMessage** captures intent from conversations via text messages
+The iMessage agent connects to the same InsForge backend as the Ada iOS app. When you text Ada a link or a thought:
 
-Same secretary. Same memory. Same action pipeline. Different input surface.
+1. **Instant reply** via local classification (GPT-4o-mini) + response (Claude Sonnet)
+2. **Background sync** creates an Item in InsForge's database and triggers the full classification pipeline
+3. **iOS app updates** in real-time via InsForge's realtime layer
 
-Concretely, this lets Ada:
-
-- **Ingest content from conversations.** Forward a link from a group chat, text Ada a thought, share a screenshot. It all flows into Ada's memory.
-- **Join group chats.** Add Ada to a group and @mention her. She'll save links, answer questions, and take actions without anyone needing the iOS app.
-- **Auto-detect forwarded content.** Messages that start with "Fwd:", contain a URL with context, or include attachments are automatically saved to memory.
-- **Sync with the iOS app.** A lightweight HTTP server lets the Ada iOS app pull iMessage-saved content into Ada's feed.
-- **Route heavy processing to InsForge.** Large documents, batch classification, and embedding generation go through the user's InsForge backend.
-
-## Architecture
-
-Ada uses a two-layer architecture (identical to the Ada iOS app):
+Everything you text to Ada shows up in your iOS app. Everything you save in the iOS app is searchable from iMessage.
 
 ```
 iMessage in (DM or group chat)
     |
-    v
-Forwarded content?  ----yes----> Auto-save to memory (tagged: imessage-forward)
-    |no
-    v
-Layer 1: GPT-4o-mini classifies intent
-    -> save | recall | act | chat | status
+    +---> Local fast path: classify + respond (instant)
     |
-    v
-Layer 2: Claude Sonnet generates secretary response
-    ^                    ^                ^
-    |                    |                |
-Supermemory (RAG)    Composio          InsForge
-persistent memory    actions           heavy compute
-                     (calendar,        (document processing,
-                      reminders,        batch classification,
-                      tasks)            embeddings)
-    |
-    v
-Jina Reader: URL extraction and summarization
+    +---> InsForge sync: create Item + trigger classify (background)
+              |
+              +---> Item appears in iOS app via realtime
+              +---> Full classification (category, actions, extracted data)
+              +---> Supermemory stores with containerTag = userId
 ```
 
-### Group Chat Mode
+### What Ada Does in iMessage
 
-When Ada is in a group chat, she follows different rules:
+- **Save anything.** Text a link, a thought, a screenshot. Ada saves it to memory and creates an Item in your feed.
+- **Recall anything.** "What was that restaurant from last week?" Ada searches your memory.
+- **Take actions.** "Remind me to call the dentist Friday." Ada creates a reminder.
+- **Join group chats.** @mention Ada in a group and she'll save links, answer questions, and act. 1-2 sentence responses only.
+- **Auto-detect forwards.** Messages starting with "Fwd:" or containing a URL with context are auto-saved without being asked.
 
-- Only responds when @mentioned by name
-- Keeps responses to 1-2 sentences
-- Saves all content she's tagged in to memory (tagged with the group name)
-- Does the most obvious thing rather than asking for clarification
+### Architecture
+
+Ada uses the same two-layer architecture as the iOS app:
+
+| Layer | Technology | Role |
+|-------|-----------|------|
+| Layer 1 | GPT-4o-mini | Intent classification (save, recall, act, chat, status) |
+| Layer 2 | Claude Sonnet | Secretary response generation |
+| Memory | Supermemory (containerTag = userId) | Per-user RAG across iOS + iMessage |
+| Actions | Composio | Calendar, reminders, tasks |
+| URLs | Jina Reader | Extract and summarize web content |
+| Backend | InsForge (@insforge/sdk) | Database, auth, edge functions, realtime |
+| Transport | @photon-ai/imessage-kit | iMessage read/write on macOS |
+
+### InsForge Integration
+
+The iMessage agent authenticates as your Ada user and writes to the same tables the iOS app reads:
+
+- **`items` table**: Every message creates an Item (same as the share extension's `saveItem()`)
+- **`classify` edge function**: Triggered on each item (same pipeline: Jina + GPT-4o-mini + action creation)
+- **Supermemory**: Uses `containerTag = userId` so memory is shared between iOS and iMessage
+- **Realtime**: Items appear in the iOS app immediately via InsForge's realtime subscriptions
+
+If InsForge is unreachable, the agent falls back to standalone mode (local classify + direct Supermemory).
 
 ### Sync Server
 
-A lightweight HTTP server (Bun.serve) runs alongside the iMessage watcher so the iOS app can pull iMessage-saved content:
+A lightweight HTTP server runs alongside the watcher so the iOS app can query iMessage-specific data:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Status check (agent name, InsForge status, group watch status) |
-| `/saved?since=ISO_DATE` | GET | Recent saves from Supermemory, optionally filtered by date |
-| `/sync` | POST | Trigger a manual memory sync |
+| `/health` | GET | Agent status, InsForge connection, group watch config |
+| `/saved?since=ISO_DATE` | GET | Search Supermemory for recent iMessage saves |
+| `/items?limit=N` | GET | Recent items from InsForge database |
+| `/sync` | POST | Trigger manual memory sync |
 
-Default port: 3001 (configurable via `SYNC_SERVER_PORT`).
+---
 
 ## Demo
 
 ```
 You:  https://paulgraham.com/founder.html - read this later
 Ada:  Saved. "Founder Mode" by Paul Graham, bookmarked with your note.
+      [Item created in iOS app with category: learning, suggested actions: summarize, create_note]
 
 You:  remind me to follow up with Riya on Friday
 Ada:  Reminder set for Friday. Following up with Riya.
+      [Action created: set_reminder in iOS app]
 
 You:  what was that Paul Graham essay I saved?
 Ada:  "Founder Mode" - you saved it 3 days ago. Here's the gist: ...
+      [Searched Supermemory with containerTag = your userId]
 
 [In a group chat]
 Friend: @Ada save this https://arxiv.org/abs/2401.00001
 Ada:  Saved.
+      [Item created with source_app: imessage-group:GroupName]
 
-[Forwarded content - auto-detected]
+[Forwarded content]
 You:  Fwd: Check out this apartment https://zillow.com/...
 Ada:  Saved that forwarded link.
+      [Auto-detected forward, saved with source: imessage-forward]
 ```
 
-## Project Structure
-
-```
-ada-imessage/
-  index.ts          Entry point. Starts iMessage watcher + sync server.
-  agent.ts          Orchestrator. Classify -> memory -> act -> respond.
-                    Handles DMs, group chats, and forwarded content.
-  classifier.ts     Layer 1: GPT-4o-mini intent classification.
-  llm.ts            Layer 2: Claude Sonnet response generation.
-                    Separate system prompts for DM vs group chat.
-  memory.ts         Supermemory integration. Save + search with source tagging.
-  actions.ts        Composio action execution (calendar, reminders, tasks).
-  config.ts         Centralized configuration. All env vars and defaults.
-  insforge.ts       InsForge backend. Heavy compute with graceful fallback.
-  sync-server.ts    HTTP server for iOS app sync.
-  .env.example      All environment variables with descriptions.
-```
+---
 
 ## Setup
 
@@ -120,11 +113,12 @@ ada-imessage/
 - macOS (iMessage requirement)
 - [Bun](https://bun.sh) >= 1.0.0
 - Full Disk Access granted to your terminal (System Settings > Privacy & Security > Full Disk Access)
+- An Ada account with InsForge credentials (from the iOS app)
 
 ### Install
 
 ```bash
-git clone https://github.com/AnirudhManjworked/ada-imessage
+git clone https://github.com/FluentFlier/ada-imessage
 cd ada-imessage
 bun install
 ```
@@ -135,61 +129,58 @@ bun install
 cp .env.example .env
 ```
 
-Fill in your `.env`. At minimum you need:
+**Required** (minimum to run):
 
 ```env
-ANTHROPIC_API_KEY=       # Claude Sonnet
-OPENAI_API_KEY=          # GPT-4o-mini
-SUPERMEMORY_API_KEY=     # Persistent memory
-OWNER_PHONE=+1234567890 # Your phone number
+OWNER_PHONE=+1234567890     # Your phone number
+ANTHROPIC_API_KEY=...        # Claude Sonnet
+OPENAI_API_KEY=...           # GPT-4o-mini
+SUPERMEMORY_API_KEY=...      # Same key as iOS app
 ```
 
-Optional for full functionality:
+**For iOS app sync** (items appear in your Ada feed):
 
 ```env
-COMPOSIO_API_KEY=        # Calendar, reminders, tasks
-JINA_API_KEY=            # URL extraction
-INSFORGE_BASE_URL=       # Heavy compute backend
-INSFORGE_API_KEY=        # InsForge auth
-WATCH_GROUPS=true        # Enable group chat monitoring
-WATCHED_GROUP_IDS=id1,id2 # Group chats to watch
+INSFORGE_URL=...             # Same as EXPO_PUBLIC_INSFORGE_URL
+INSFORGE_ANON_KEY=...        # Same as EXPO_PUBLIC_INSFORGE_ANON_KEY
+INSFORGE_USER_EMAIL=...      # Your Ada account email
+INSFORGE_USER_PASSWORD=...   # Your Ada account password
 ```
 
 ### Run
 
 ```bash
-# Start Ada (iMessage watcher + sync server)
-bun run start
-
-# Development mode (auto-reload + debug logging)
-bun run dev
-
-# Sync server only (no iMessage watcher)
-bun run sync-server
+bun run start                # Start Ada (iMessage watcher + sync server)
+bun run dev                  # Development mode (auto-reload + debug logging)
+bun run sync-server          # Sync server only
 ```
 
-Ada will send you an iMessage when she's online.
+Ada will text you when she's online.
 
-## Stack
+---
 
-All choices match the Ada iOS app exactly:
+## Project Structure
 
-| Layer | Technology | Purpose |
-|-------|-----------|---------|
-| Transport | @photon-ai/imessage-kit | iMessage read/write on macOS |
-| Classification | GPT-4o-mini | Layer 1: intent classification |
-| Response | Claude Sonnet (Anthropic API) | Layer 2: secretary responses |
-| Memory | Supermemory API | RAG and personalization |
-| URL Extraction | Jina Reader | Fetch and summarize web content |
-| Actions | Composio | Calendar, reminders, tasks |
-| Heavy Compute | InsForge | Document processing, embeddings |
-| Runtime | Bun + TypeScript | Fast, native TypeScript execution |
+```
+ada-imessage/
+  index.ts          Entry point. Auth + iMessage watcher + sync server.
+  agent.ts          Orchestrator. Dual pipeline: local fast path + InsForge sync.
+  classifier.ts     Layer 1: GPT-4o-mini intent classification.
+  llm.ts            Layer 2: Claude Sonnet response generation (DM + group modes).
+  memory.ts         Supermemory with containerTag = userId (per-user, shared with iOS).
+  actions.ts        Composio action execution (calendar, reminders, tasks).
+  config.ts         Centralized config. InsForge URL/key mirrors iOS app constants.
+  insforge.ts       @insforge/sdk client. Auth, item CRUD, classify trigger, search.
+  sync-server.ts    HTTP server for iOS app sync + InsForge item queries.
+```
+
+---
 
 ## Built By
 
 [Anirudh Manjesh](https://linkedin.com/in/amanjesh) - Founder of Ada, CS @ ASU Barrett Honors College
 
-[tryada.app](https://tryada.app) - Join the waitlist
+[tryada.app](https://tryada.app)
 
 ## License
 

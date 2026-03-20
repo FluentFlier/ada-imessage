@@ -9,6 +9,7 @@
     "sync-server": "bun run sync-server.ts"
   },
   "dependencies": {
+    "@insforge/sdk": "latest",
     "@photon-ai/imessage-kit": "latest",
     "openai": "^4.0.0"
   },

@@ -1,15 +1,28 @@
 /**
  * Ada's core agent loop.
  * Orchestrates: classify -> memory -> act -> respond
- * Supports both DM and group chat contexts.
+ *
+ * Dual pipeline:
+ * 1. LOCAL (fast path): GPT-4o-mini classifier + Claude Sonnet response
+ *    -> instant iMessage reply
+ * 2. INSFORGE (sync path): Create Item in database + trigger classify edge function
+ *    -> item appears in iOS app with full classification, actions, etc.
+ *
+ * Both run in parallel so the user gets an instant reply AND the iOS app stays in sync.
  */
 
 import { config } from "./config.ts";
 import { classify } from "./classifier.ts";
-import { saveToMemory, saveUrl, searchMemory } from "./memory.ts";
+import { saveToMemory, saveUrl, searchMemory, buildMemoryContent } from "./memory.ts";
 import { executeAction, inferActionType } from "./actions.ts";
 import { generateResponse } from "./llm.ts";
-import { processDocument } from "./insforge.ts";
+import {
+  saveItem,
+  triggerClassify,
+  chat as insforgeChat,
+  isConnected,
+  type ContentType,
+} from "./insforge.ts";
 import type { Message } from "@photon-ai/imessage-kit";
 
 export interface AgentResponse {
@@ -24,31 +37,60 @@ export interface GroupContext {
 
 /**
  * Detect if a message looks like forwarded content.
- * Patterns: "Fwd:", "FW:", URL with surrounding context text,
- * or attachment indicators.
  */
 function isForwardedContent(text: string, hasAttachments?: boolean): boolean {
   const lower = text.toLowerCase();
-  // Explicit forward prefixes
   if (lower.startsWith("fwd:") || lower.startsWith("fw:")) return true;
-  // URL with surrounding context (not just a bare link)
   const urlMatch = text.match(/https?:\/\/[^\s]+/);
   if (urlMatch) {
     const textWithoutUrl = text.replace(urlMatch[0], "").trim();
-    // If there's meaningful text around the URL, likely forwarded
     if (textWithoutUrl.length > 20) return true;
   }
-  // Screenshot or file attachment
   if (hasAttachments) return true;
   return false;
 }
 
 /**
- * Strip the @Ada mention from a group chat message to get the actual request.
+ * Strip the @Ada mention from a group chat message.
  */
 function stripMention(text: string): string {
   const pattern = new RegExp(`@?${config.adaName}\\s*`, "i");
   return text.replace(pattern, "").trim();
+}
+
+/**
+ * Detect content type for InsForge item creation.
+ */
+function detectContentType(text: string): ContentType {
+  if (/https?:\/\/[^\s]+/.test(text)) return "link";
+  return "text";
+}
+
+/**
+ * Sync a message to InsForge (fire-and-forget).
+ * Creates an Item in the database and triggers classification.
+ * The item then appears in the iOS app via realtime.
+ */
+async function syncToInsForge(
+  text: string,
+  sourceApp = "imessage"
+): Promise<void> {
+  if (!isConnected()) return;
+
+  try {
+    const type = detectContentType(text);
+    const content = type === "link"
+      ? text.match(/https?:\/\/[^\s]+/)?.[0] ?? text
+      : text;
+
+    const itemId = await saveItem({ type, content, sourceApp });
+    if (itemId) {
+      // Trigger classify in the background - don't await
+      triggerClassify(itemId, { type, raw_content: content }).catch(() => {});
+    }
+  } catch (err) {
+    console.error("[sync] InsForge sync failed (non-fatal):", err);
+  }
 }
 
 /**
@@ -73,8 +115,12 @@ export async function handleMessage(msg: Message): Promise<AgentResponse> {
     return handleForwardedContent(text);
   }
 
-  // Layer 1: Classify intent
-  const classified = await classify(text);
+  // Run local classification + InsForge sync in parallel
+  const [classified] = await Promise.all([
+    classify(text),
+    syncToInsForge(text),
+  ]);
+
   console.log(
     `[ada] Intent: ${classified.intent} (${classified.confidence.toFixed(2)})`
   );
@@ -94,28 +140,14 @@ export async function handleMessage(msg: Message): Promise<AgentResponse> {
           metadata: { url: classified.url, intent: "save", type: "link" },
         });
       } else {
-        // Large text content goes through InsForge
-        if (text.length > 1000) {
-          const processed = await processDocument(text);
-          await saveToMemory({
-            content: processed.content,
-            metadata: {
-              intent: "save",
-              type: "note",
-              summary: processed.summary,
-              topics: classified.entities.topics?.join(", ") ?? "",
-            },
-          });
-        } else {
-          await saveToMemory({
-            content: text,
-            metadata: {
-              intent: "save",
-              type: "note",
-              topics: classified.entities.topics?.join(", ") ?? "",
-            },
-          });
-        }
+        await saveToMemory({
+          content: text,
+          metadata: {
+            intent: "save",
+            type: "note",
+            topics: classified.entities.topics?.join(", ") ?? "",
+          },
+        });
       }
       break;
     }
@@ -153,13 +185,13 @@ export async function handleMessage(msg: Message): Promise<AgentResponse> {
       break;
   }
 
-  // Search memory for context (always useful except pure saves)
+  // Search memory for context
   const memoryContext =
     classified.intent !== "save"
       ? await searchMemory(classified.summary || text)
       : [];
 
-  // Layer 2: Generate Ada's response
+  // Generate Ada's response
   const reply = await generateResponse(
     text,
     classified,
@@ -174,7 +206,6 @@ export async function handleMessage(msg: Message): Promise<AgentResponse> {
 
 /**
  * Handle a group chat message where Ada was mentioned.
- * More concise responses. Saves tagged content to memory with group context.
  */
 export async function handleGroupMessage(
   msg: Message,
@@ -197,10 +228,15 @@ export async function handleGroupMessage(
     groupName: group.chatName ?? group.chatId,
   };
 
+  // Sync to InsForge + classify locally in parallel
+  const [classified] = await Promise.all([
+    classify(text),
+    syncToInsForge(text, `imessage-group:${group.chatName ?? group.chatId}`),
+  ]);
+
   // Check for forwarded content in group
   const hasAttachments = !!(msg as Record<string, unknown>).attachments;
   if (isForwardedContent(text, hasAttachments)) {
-    console.log("[ada] Forwarded content in group, auto-saving");
     const url = text.match(/https?:\/\/[^\s]+/)?.[0];
     if (url) {
       await saveUrl(url, text.replace(url, "").trim() || undefined, memoryOptions);
@@ -209,12 +245,6 @@ export async function handleGroupMessage(
     }
     return { text: "Saved.", handled: true };
   }
-
-  // Classify and route
-  const classified = await classify(text);
-  console.log(
-    `[ada] Group intent: ${classified.intent} (${classified.confidence.toFixed(2)})`
-  );
 
   let actionResult: { success: boolean; message: string } | undefined;
 
@@ -258,7 +288,7 @@ export async function handleGroupMessage(
       break;
   }
 
-  // Always save content Ada is tagged in (group context)
+  // Save all group content Ada is tagged in
   if (classified.intent !== "save") {
     await saveToMemory(
       {
@@ -288,14 +318,16 @@ export async function handleGroupMessage(
 
 /**
  * Handle auto-detected forwarded content.
- * Saves to memory with "imessage-forward" source tag.
+ * Auto-saves with "imessage-forward" source tag + syncs to InsForge.
  */
 async function handleForwardedContent(text: string): Promise<AgentResponse> {
   const url = text.match(/https?:\/\/[^\s]+/)?.[0];
   const forwardOptions = { source: "imessage-forward" };
 
+  // Sync to InsForge in background
+  syncToInsForge(text, "imessage-forward").catch(() => {});
+
   if (url) {
-    // Strip "Fwd:" prefix for cleaner context
     const context = text
       .replace(/^(fwd|fw):\s*/i, "")
       .replace(url, "")
@@ -304,25 +336,11 @@ async function handleForwardedContent(text: string): Promise<AgentResponse> {
     return { text: "Saved that forwarded link.", handled: true };
   }
 
-  // Plain forwarded text
   const cleanText = text.replace(/^(fwd|fw):\s*/i, "").trim();
-
-  // Large forwarded content goes through InsForge
-  if (cleanText.length > 1000) {
-    const processed = await processDocument(cleanText);
-    await saveToMemory(
-      {
-        content: processed.content,
-        metadata: { type: "forward", summary: processed.summary },
-      },
-      forwardOptions
-    );
-  } else {
-    await saveToMemory(
-      { content: cleanText, metadata: { type: "forward" } },
-      forwardOptions
-    );
-  }
+  await saveToMemory(
+    { content: cleanText, metadata: { type: "forward" } },
+    forwardOptions
+  );
 
   return { text: "Saved that forwarded message.", handled: true };
 }

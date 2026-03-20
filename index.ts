@@ -10,10 +10,23 @@ import { IMessageSDK } from "@photon-ai/imessage-kit";
 import { config, isOwner, isWatchedGroup } from "./config.ts";
 import { handleMessage, handleGroupMessage } from "./agent.ts";
 import { startSyncServer } from "./sync-server.ts";
+import { authenticate, isConnected } from "./insforge.ts";
 
 if (!config.ownerPhone) {
   console.error("OWNER_PHONE is required. Set it in your .env file.");
   process.exit(1);
+}
+
+// Authenticate with InsForge (connects to same backend as iOS app)
+if (config.insforge.enabled) {
+  const userId = await authenticate();
+  if (userId) {
+    console.log(`[insforge] Connected. Items will sync to iOS app.`);
+  } else {
+    console.log(`[insforge] Auth failed. Running in standalone mode.`);
+  }
+} else {
+  console.log(`[insforge] Not configured. Running in standalone mode.`);
 }
 
 const sdk = new IMessageSDK({

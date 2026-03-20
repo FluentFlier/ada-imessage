@@ -3,14 +3,15 @@
  * Runs on Bun.serve.
  *
  * Endpoints:
- *   GET  /health        - Status check
+ *   GET  /health        - Status check (InsForge connection, group watch)
  *   GET  /saved?since=  - Recent saves from Supermemory (ISO date filter)
+ *   GET  /items?limit=  - Recent items from InsForge database
  *   POST /sync          - Trigger a manual memory sync
  */
 
 import { config } from "./config.ts";
 import { searchMemory } from "./memory.ts";
-import { isInsForgeHealthy } from "./insforge.ts";
+import { isConnected, getRecentItems } from "./insforge.ts";
 
 export function startSyncServer() {
   const port = config.syncServerPort;
@@ -25,7 +26,6 @@ export function startSyncServer() {
         "Access-Control-Allow-Origin": "*",
       };
 
-      // CORS preflight
       if (req.method === "OPTIONS") {
         return new Response(null, {
           headers: {
@@ -38,20 +38,20 @@ export function startSyncServer() {
 
       // GET /health
       if (url.pathname === "/health" && req.method === "GET") {
-        const insforgeUp = await isInsForgeHealthy();
         return Response.json(
           {
             status: "ok",
             agent: config.adaName,
             source: "imessage",
-            insforge: insforgeUp ? "connected" : "unavailable",
+            insforge: isConnected() ? "connected" : "standalone",
             groupWatch: config.watchGroups,
+            watchedGroups: config.watchedGroupIds.length,
           },
           { headers: corsHeaders }
         );
       }
 
-      // GET /saved?since=ISO_DATE
+      // GET /saved?since=ISO_DATE - search Supermemory
       if (url.pathname === "/saved" && req.method === "GET") {
         const since = url.searchParams.get("since");
         const query = since
@@ -60,6 +60,16 @@ export function startSyncServer() {
         const results = await searchMemory(query);
         return Response.json(
           { results, query, since },
+          { headers: corsHeaders }
+        );
+      }
+
+      // GET /items?limit=N - get recent items from InsForge database
+      if (url.pathname === "/items" && req.method === "GET") {
+        const limit = parseInt(url.searchParams.get("limit") ?? "20", 10);
+        const items = await getRecentItems(limit);
+        return Response.json(
+          { items, count: items.length },
           { headers: corsHeaders }
         );
       }
