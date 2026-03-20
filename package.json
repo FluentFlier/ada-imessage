@@ -1,0 +1,18 @@
+{
+  "name": "ada-imessage",
+  "version": "0.1.0",
+  "description": "iMessage input channel for Ada - an AI secretary that lives in the iOS share sheet",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "NODE_ENV=development bun run --watch index.ts",
+    "sync-server": "bun run sync-server.ts"
+  },
+  "dependencies": {
+    "@photon-ai/imessage-kit": "latest",
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
