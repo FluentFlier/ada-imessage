@@ -29,8 +29,9 @@ export const config = {
     },
   },
 
-  // InsForge user credentials for the iMessage agent to authenticate
-  // This is the Ada user account whose items/memory the agent reads/writes.
+  // InsForge user credentials (optional fallback if OAuth fails)
+  // Primary auth is Google OAuth via browser. These are only used
+  // if OAuth is unavailable (e.g. headless server).
   insforgeUser: {
     email: process.env.INSFORGE_USER_EMAIL ?? "",
     password: process.env.INSFORGE_USER_PASSWORD ?? "",

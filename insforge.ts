@@ -2,30 +2,64 @@
  * InsForge integration for Ada iMessage agent.
  *
  * This mirrors the iOS app's services/insforge.ts + insforge-queries.ts
- * but for a server-side (Bun) context instead of React Native.
+ * but for a server-side (Bun/macOS) context instead of React Native.
+ *
+ * Auth strategy (in priority order):
+ * 1. Cached session from previous run (persisted to ~/.ada-imessage-session)
+ * 2. Google OAuth via PKCE (opens browser, catches callback on localhost)
+ * 3. Email/password fallback (if INSFORGE_USER_EMAIL + PASSWORD are set)
  *
  * The iMessage agent authenticates as the user and creates items in the
  * same database the iOS app reads from. When the agent saves something
  * from iMessage, it shows up in the iOS app via realtime.
- *
- * Flow: iMessage in -> create Item -> trigger classify edge function
- *       -> item appears in iOS app with category, actions, etc.
  */
 
 import { createClient } from "@insforge/sdk";
 import { config } from "./config.ts";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
-// Simple in-memory token storage for server-side use (no SecureStore needed)
-const tokenStore: Record<string, string> = {};
-const memoryStorage = {
+// ─── Persistent Token Storage ───────────────────────────────────────
+// Persists session to ~/.ada-imessage/session.json so the user doesn't
+// have to re-authenticate on every restart.
+
+const SESSION_DIR = join(homedir(), ".ada-imessage");
+const SESSION_FILE = join(SESSION_DIR, "session.json");
+
+function loadPersistedTokens(): Record<string, string> {
+  try {
+    if (existsSync(SESSION_FILE)) {
+      return JSON.parse(readFileSync(SESSION_FILE, "utf-8"));
+    }
+  } catch {}
+  return {};
+}
+
+function persistTokens(tokens: Record<string, string>) {
+  try {
+    if (!existsSync(SESSION_DIR)) {
+      mkdirSync(SESSION_DIR, { recursive: true });
+    }
+    writeFileSync(SESSION_FILE, JSON.stringify(tokens, null, 2));
+  } catch (err) {
+    console.warn("[insforge] Failed to persist session:", err);
+  }
+}
+
+const tokenStore = loadPersistedTokens();
+
+const diskStorage = {
   getItem(key: string) {
     return tokenStore[key] ?? null;
   },
   async setItem(key: string, value: string) {
     tokenStore[key] = value;
+    persistTokens(tokenStore);
   },
   async removeItem(key: string) {
     delete tokenStore[key];
+    persistTokens(tokenStore);
   },
 };
 
@@ -41,7 +75,7 @@ function getClient() {
     client = createClient({
       baseUrl: config.insforge.url,
       anonKey: config.insforge.anonKey,
-      storage: memoryStorage,
+      storage: diskStorage,
       autoRefreshToken: true,
       persistSession: true,
     });
@@ -49,9 +83,101 @@ function getClient() {
   return client;
 }
 
+// ─── OAuth PKCE (Google) ────────────────────────────────────────────
+// Same flow as the iOS app's oauthSignIn() in services/insforge.ts,
+// adapted for macOS: opens the system browser, catches the callback
+// on a temporary localhost HTTP server.
+
+async function oauthSignIn(): Promise<string | null> {
+  const c = getClient();
+  if (!c) return null;
+
+  const CALLBACK_PORT = 9876;
+  const redirectUrl = `http://localhost:${CALLBACK_PORT}/auth/callback`;
+
+  // Step 1: Get OAuth URL + PKCE code verifier from InsForge
+  const { data, error } = await c.auth.signInWithOAuth({
+    provider: "google",
+    redirectTo: redirectUrl,
+    skipBrowserRedirect: true,
+  });
+
+  if (error || !data?.url) {
+    console.error("[insforge] OAuth init failed:", error?.message ?? "no URL");
+    return null;
+  }
+
+  const codeVerifier = data.codeVerifier;
+
+  // Step 2: Start a temporary localhost server to catch the callback
+  const authCode = await new Promise<string | null>((resolve) => {
+    const timeout = setTimeout(() => {
+      server.stop();
+      console.log("[insforge] OAuth timed out (60s). Try again.");
+      resolve(null);
+    }, 60_000);
+
+    const server = Bun.serve({
+      port: CALLBACK_PORT,
+      fetch(req) {
+        const url = new URL(req.url);
+
+        if (url.pathname === "/auth/callback") {
+          const code = url.searchParams.get("code");
+          clearTimeout(timeout);
+
+          // Respond with a simple success page, then shut down
+          setTimeout(() => server.stop(), 500);
+          resolve(code);
+
+          return new Response(
+            `<html><body style="font-family:system-ui;text-align:center;padding:60px">
+              <h2>Ada is connected.</h2>
+              <p>You can close this tab and go back to your terminal.</p>
+            </body></html>`,
+            { headers: { "Content-Type": "text/html" } }
+          );
+        }
+
+        return new Response("Not found", { status: 404 });
+      },
+    });
+
+    // Step 3: Open the OAuth URL in the user's default browser
+    console.log("[insforge] Opening browser for Google sign-in...");
+    Bun.spawn(["open", data.url]);
+  });
+
+  if (!authCode) return null;
+
+  // Step 4: Exchange the authorization code for a session
+  const { data: exchangeData, error: exchangeError } =
+    await c.auth.exchangeOAuthCode(authCode, codeVerifier);
+
+  if (exchangeError || !exchangeData?.user) {
+    console.error(
+      "[insforge] OAuth code exchange failed:",
+      exchangeError?.message ?? "no user"
+    );
+    return null;
+  }
+
+  authenticatedUserId = exchangeData.user.id;
+  console.log(
+    `[insforge] Signed in as ${exchangeData.user.email} via Google`
+  );
+  return authenticatedUserId;
+}
+
+// ─── Authentication ─────────────────────────────────────────────────
+
 /**
- * Authenticate the iMessage agent as the Ada user.
- * Must be called once at startup. Caches the session.
+ * Authenticate the iMessage agent.
+ *
+ * Strategy:
+ * 1. Try to resume a cached session (persisted to disk)
+ * 2. If no session, try Google OAuth (opens browser)
+ * 3. If OAuth fails/unavailable, fall back to email/password
  */
 export async function authenticate(): Promise<string | null> {
   const c = getClient();
@@ -60,31 +186,41 @@ export async function authenticate(): Promise<string | null> {
     return null;
   }
 
-  const { email, password } = config.insforgeUser;
-  if (!email || !password) {
-    console.warn("[insforge] No user credentials, running in standalone mode");
-    return null;
-  }
-
   try {
-    // Check if we already have a session
+    // 1. Try to resume an existing session
     const { data: existing } = await c.auth.getCurrentUser();
     if (existing?.user?.id) {
       authenticatedUserId = existing.user.id;
-      console.log(`[insforge] Resumed session for ${existing.user.email}`);
+      console.log(
+        `[insforge] Resumed session for ${existing.user.email}`
+      );
       return authenticatedUserId;
     }
 
-    // Sign in
-    const { data, error } = await c.auth.signInWithPassword({ email, password });
-    if (error) {
-      console.error("[insforge] Auth failed:", error.message);
-      return null;
+    // 2. Try Google OAuth (opens browser on macOS)
+    console.log("[insforge] No cached session. Starting OAuth...");
+    const oauthResult = await oauthSignIn();
+    if (oauthResult) return oauthResult;
+
+    // 3. Fall back to email/password if provided
+    const { email, password } = config.insforgeUser;
+    if (email && password) {
+      console.log("[insforge] OAuth failed. Trying email/password...");
+      const { data, error } = await c.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (error) {
+        console.error("[insforge] Email/password auth failed:", error.message);
+        return null;
+      }
+      authenticatedUserId = data?.user?.id ?? null;
+      console.log(`[insforge] Authenticated as ${email}`);
+      return authenticatedUserId;
     }
 
-    authenticatedUserId = data?.user?.id ?? null;
-    console.log(`[insforge] Authenticated as ${email}`);
-    return authenticatedUserId;
+    console.warn("[insforge] All auth methods failed. Running standalone.");
+    return null;
   } catch (err) {
     console.error("[insforge] Auth error:", err);
     return null;
@@ -113,7 +249,9 @@ interface SaveItemParams {
  * This is the same as the iOS share handler's saveItem().
  * The item will appear in the iOS app immediately via realtime.
  */
-export async function saveItem(params: SaveItemParams): Promise<string | null> {
+export async function saveItem(
+  params: SaveItemParams
+): Promise<string | null> {
   const c = getClient();
   if (!c || !authenticatedUserId) return null;
 
@@ -209,9 +347,7 @@ export async function chat(message: string): Promise<string | null> {
 /**
  * Semantic search via InsForge's search edge function.
  */
-export async function searchItems(
-  query: string
-): Promise<string[]> {
+export async function searchItems(query: string): Promise<string[]> {
   const c = getClient();
   if (!c || !authenticatedUserId) return [];
 
